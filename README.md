@@ -1,10 +1,11 @@
 # 多设备现场录音时间轴对齐服务（timeline-align）
 
-多台录音设备各自携带本地时钟，通过**同步锚点**（设备本地毫秒 ↔ UTC 毫秒）把录到的**声段**对齐到统一 UTC 时间轴。服务以 HTTP API 提供设备/**时钟周期**/锚点/声段录入、线性漂移对齐、锚点更正重算、不可变版本发布与版本间差异（位移/新增/移除）查询。
+多台录音设备各自携带本地时钟，通过**同步锚点**（设备本地毫秒 ↔ UTC 毫秒）把录到的**声段**对齐到统一 UTC 时间轴。服务以 HTTP API 提供设备/**时钟周期**/锚点/声段录入、线性漂移对齐、锚点更正重算、不可变版本发布与版本间差异（位移/新增/移除）查询；现场核对完成后可把单个**时钟周期封存**，防止晚到记录改动已确认时间线。
 
 - 纯 Python 标准库实现（`http.server` + `sqlite3`），**无第三方依赖**，Python ≥ 3.10
-- SQLite 单文件存储，WAL 模式；写操作单事务（`BEGIN IMMEDIATE`），发布与更正并发时每个版本仍对应一套完整自洽的锚点+声段快照
+- SQLite 单文件存储，WAL 模式；写操作单事务（`BEGIN IMMEDIATE`），发布、更正与封存并发时每个结果仍对应一套完整自洽的锚点+声段快照
 - **时钟周期（cycle，v1.1 新增）**：设备每次重启本地毫秒归零，可按"周期"登记编号；不同周期可复用同一本地毫秒值，锚点递增校验与线性映射**按周期独立执行**，声段只使用所属周期的锚点。旧库启动即自动迁移，**已发布旧版本查询结果完全不变**。
+- **周期封存（seal，v1.2 新增）**：现场核对后凭"锚点+声段内容"生成的稳定指纹封存单台设备的一个周期；封存事务内核对指纹且要求全部声段可定位，封存**不可撤销**，此后该周期锚点与声段拒绝一切新增/更正/删除（同内容声段重传仍幂等、异内容仍冲突）。旧库周期默认未封存。
 
 ## 快速开始
 
@@ -62,8 +63,36 @@ python3 -m app          # 自动建库建表（默认 ./data/timeline.db），�
 - **本地毫秒按周期复用**：锚点主键为 `(设备, 周期, local_ms)`，同一设备不同周期可使用相同的 `local_ms`；同一周期内仍要求本地时间严格唯一且 UTC 严格递增。
 - **每周期独立映射**：锚点递增校验、线性漂移均在 `(设备, 周期)` 内独立执行；声段起止**只使用其所属周期的锚点**，所属周期覆盖不足仍为 `unlocatable`，绝不借用其他周期（包括 default）的锚点。
 - **周期不存在即拒绝**：锚点/声段引用未登记周期 → `404 cycle_not_found`，且不写入任何数据。
-- `GET /devices/{id}/cycles` 列出设备全部周期（含各周期锚点/声段计数）；
+- `GET /devices/{id}/cycles` 列出设备全部周期（含各周期锚点/声段计数、封存状态与稳定指纹）；
+  `GET /devices/{id}/cycles/{cycle_id}` 返回单个周期详情（含封存状态、封存时间、指纹及不可定位声段清单）；
   `GET /devices/{id}/anchors` 与 `GET /segments` 支持 `?cycle_id=` 过滤（按周期过滤声段时需同时给 `device_id`）。
+
+### 周期封存（seal）
+
+现场核对完成后，操作员封存**单台设备的一个时钟周期**，防止晚到记录改动已确认时间线。封存是 `(设备, 周期)` 粒度，与版本发布相互独立、可并行使用。
+
+1. **取指纹**：`GET /devices/{id}/cycles/{cycle_id}` 返回：
+   - `fingerprint`：由该周期**锚点内容**（按 `local_ms` 排序的 `(local_ms, utc_ms)`）与**全部声段内容**（按 `capture_id` 排序的采集编号、本地起止、note）规范化后做 SHA-256 得到的 64 位十六进制稳定指纹；未封存时按当前内容实时计算，内容一变指纹即变；
+   - `sealed` / `sealed_at`：封存状态与封存时间；
+   - `unlocatable_captures`：当前不可定位声段清单。
+2. **封存**：`POST /devices/{id}/cycles/{cycle_id}/seal`，请求体 `{"fingerprint": "..."}`。服务在**同一个写事务内**：
+   - 重算当前内容指纹并与携带指纹核对——不一致（指纹过期/内容已被晚到记录改动）→ `409 fingerprint_mismatch`，响应附带 `current_fingerprint`，**状态不变**；
+   - 检查该周期**全部声段均可定位**——存在不可定位声段 → `409 cycle_not_sealable`（附带 `unlocatable_captures`），**状态不变**；
+   - 两项通过才落封存标记，返回 `201`、`sealed_at`（封存时间）与最终 `fingerprint`。
+3. **幂等与不可撤销**：对已封存周期用**相同指纹**重复封存 → `200` 幂等返回**首次**封存结果（同一 `sealed_at`/指纹，`idempotent_replay: true`）；用不同指纹 → `409 fingerprint_mismatch`。封存无撤销接口。
+4. **封存后的写入规则**：
+
+   | 操作 | 封存后的结果 |
+   |---|---|
+   | 该周期锚点新增（POST）、单个删除（DELETE） | `409 cycle_sealed` |
+   | 锚点更正 PUT **涉及**该周期（即使同时带其他周期） | `409 cycle_sealed`，**整体拒绝**，其他周期不受影响 |
+   | 该周期声段新增（新采集编号）、删除 | `409 cycle_sealed` |
+   | **同内容**声段重传 | 仍按现有幂等规则 `200`（不写入，返回当前投影） |
+   | **异内容**声段重传 | 仍按现有冲突规则 `409 capture_conflict` |
+
+   幂等/冲突判定先于封存拦截，因此迟到但内容一致的回传不会报错，真正会改动时间线的请求才被拒绝。设备、其他周期（含其他设备同编号周期）以及版本发布/查询行为均不受影响。
+
+> 空周期（无锚点且无声段）也可封存；封存后同样不能再写入。周期登记（POST cycles）不是锚点/声段内容操作，不受封存影响。
 
 ### 线性漂移映射
 
@@ -91,6 +120,10 @@ utc(t) = u0 + (t - l0) * (u1 - u0) / (l1 - l0)     # 结果四舍五入到毫秒
 | 请求体非 JSON / 非对象 | `400 invalid_json` / `400 validation_error` |
 | 同采集编号异内容重传（含周期不同） | `409 capture_conflict` |
 | 设备号已存在且 name 不一致 | `409 device_conflict` |
+| 写入/更正/删除已封存周期的锚点或声段（PUT 涉及封存周期整体拒绝） | `409 cycle_sealed` |
+| 封存指纹与周期当前内容不一致（指纹过期/内容已改动） | `409 fingerprint_mismatch` |
+| 封存时该周期存在不可定位声段 | `409 cycle_not_sealable` |
+| 封存指纹格式非法（非 64 位十六进制） | `400 validation_error` |
 
 ### 幂等与冲突
 
@@ -111,8 +144,9 @@ utc(t) = u0 + (t - l0) * (u1 - u0) / (l1 - l0)     # 结果四舍五入到毫秒
 
 ### 锚点更正（按周期）
 
-- `PUT /devices/{id}/anchors`：请求体顶层可带 `cycle_id`（省略为 `default`），`anchors` 每一项也可各自带 `cycle_id`（缺省取顶层值）；每个被引用周期独立做严格递增校验，**仅替换被引用周期**的锚点，其他周期不变；任一引用周期不存在或校验失败 → 整体拒绝、不写入。
-- `DELETE /devices/{id}/anchors/{local_ms}?cycle_id=...`：删除单个锚点；`cycle_id` 省略时删 `default` 周期（与旧版路径行为一致）。
+- `PUT /devices/{id}/anchors`：请求体顶层可带 `cycle_id`（省略为 `default`），`anchors` 每一项也可各自带 `cycle_id`（缺省取顶层值）；每个被引用周期独立做严格递增校验，**仅替换被引用周期**的锚点，其他周期不变；任一引用周期不存在或校验失败 → 整体拒绝、不写入；**任一引用周期已封存也整体拒绝**（`409 cycle_sealed`），其他周期不受影响。
+- `DELETE /devices/{id}/anchors/{local_ms}?cycle_id=...`：删除单个锚点；`cycle_id` 省略时删 `default` 周期（与旧版路径行为一致）；该周期已封存 → `409 cycle_sealed`。
+- 已封存周期的锚点无法通过更正解封；封存只冻结"当前时间线"的写入，已发布版本与封存互不相干（封存后仍可发布，发布也不改变封存状态）。
 
 ## API 一览
 
@@ -122,7 +156,9 @@ utc(t) = u0 + (t - l0) * (u1 - u0) / (l1 - l0)     # 结果四舍五入到毫秒
 | POST | `/devices` | 注册设备 `{device_id, name?}`（自动创建 `default` 周期） |
 | GET | `/devices` / `/devices/{id}` | 设备列表 / 详情（含周期与锚点） |
 | POST | `/devices/{id}/cycles` | 登记时钟周期 `{cycle_id, note?}` |
-| GET | `/devices/{id}/cycles` | 周期列表（含各周期锚点/声段计数） |
+| GET | `/devices/{id}/cycles` | 周期列表（含各周期锚点/声段计数、封存状态与稳定指纹） |
+| GET | `/devices/{id}/cycles/{cycle_id}` | 周期详情（指纹/封存状态/封存时间/不可定位声段） |
+| POST | `/devices/{id}/cycles/{cycle_id}/seal` | **封存周期** `{"fingerprint": "..."}`（事务内核对内容+全部可定位） |
 | POST | `/devices/{id}/anchors` | 录入锚点 `{local_ms, utc_ms, cycle_id?}`（省略周期=default） |
 | GET | `/devices/{id}/anchors` | 锚点列表（可加 `?cycle_id=`；每条带 `cycle_id`） |
 | PUT | `/devices/{id}/anchors` | **锚点更正**：按周期整体替换 `{cycle_id?, anchors:[...]}`（原子生效） |
@@ -205,6 +241,40 @@ curl -s -X PUT $BASE/devices/D1/anchors -H 'Content-Type: application/json' \
 # 也可一次替换多个周期：anchors 各项自带 cycle_id（缺省项归入顶层 cycle_id/default）
 ```
 
+### 周期封存（现场核对后冻结单个周期）
+
+```bash
+BASE=http://localhost:8000
+DEV=D1; CYC=boot-2
+
+# 1. 核对：取周期详情（稳定指纹 + 封存状态 + 不可定位声段清单）
+curl -s $BASE/devices/$DEV/cycles/$CYC
+FP=$(curl -s $BASE/devices/$DEV/cycles/$CYC |
+  python3 -c 'import sys,json;print(json.load(sys.stdin)["cycle"]["fingerprint"])')
+
+# 2. 携带指纹封存：同一事务内核对内容且全部声段可定位 -> 201
+curl -s -X POST $BASE/devices/$DEV/cycles/$CYC/seal \
+  -H 'Content-Type: application/json' -d "{\"fingerprint\":\"$FP\"}"
+# => {"device_id":"D1","cycle_id":"boot-2","sealed":true,
+#     "sealed_at":"2026-10-05T06:07:43.049Z",
+#     "fingerprint":"97811c9e...","idempotent_replay":false}
+
+# 3. 指纹过期（期间来了晚到记录）-> 409 fingerprint_mismatch，响应给当前指纹，状态不变
+curl -s -X POST $BASE/devices/$DEV/cycles/$CYC/seal -H 'Content-Type: application/json' \
+  -d '{"fingerprint":"0000000000000000000000000000000000000000000000000000000000000000"}'
+
+# 4. 周期存在不可定位声段 -> 409 cycle_not_sealable（附带 unlocatable_captures）
+
+# 5. 重复相同封存请求 -> 200 幂等返回首次结果（sealed_at 与首次一致）
+curl -s -X POST $BASE/devices/$DEV/cycles/$CYC/seal \
+  -H 'Content-Type: application/json' -d "{\"fingerprint\":\"$FP\"}"
+
+# 6. 封存后：锚点增删/更正、声段增删 -> 409 cycle_sealed；
+#    同内容声段重传仍 200 幂等，异内容仍 409 capture_conflict
+curl -s -X POST $BASE/devices/$DEV/anchors -H 'Content-Type: application/json' \
+  -d '{"cycle_id":"boot-2","local_ms":30000,"utc_ms":1700010030000}'   # 409 cycle_sealed
+```
+
 完整演示脚本（覆盖幂等、冲突、越界、排序、版本差异）：
 
 ```bash
@@ -265,8 +335,18 @@ python3 -m unittest discover -s tests -v
 
 - `tests/test_api.py`（17 个）：锚点严格递增校验、非法时间、起止倒置、幂等/冲突、线性漂移与取整、无法定位、排序规则、版本不可变、位移/新增/移除、以及**更正与发布并发**下快照完整性；
 - `tests/test_cycles.py`（19 个）：周期登记幂等/冲突、默认周期、跨周期复用本地毫秒、各周期独立递增与独立映射、声段仅用所属周期锚点（覆盖不足仍 `unlocatable`）、周期不存在拒绝不写入、采集编号全局唯一且**周期计入内容**、时间轴/新版显示周期归属、发布原子冻结各周期、以及 **v1 旧库在线迁移**（已有数据归 default、旧声段默认周期重传仍幂等、已发布旧版本查询结果逐字段不变、迁移后发布为周期格式）。
+- `tests/test_seals.py`（21 个）：周期详情指纹/封存状态、指纹稳定与内容敏感、封存成功返回封存时间与最终指纹、相同请求幂等返回首次结果、指纹过期与不可定位声段拒绝且状态不变、空周期可封存、封存后锚点/声段增删更正全部拒绝、同内容重传仍幂等/异内容仍冲突、PUT 涉及封存周期整体拒绝而其他周期不受影响、跨设备同周期编号独立、封存与发布共存、以及 **v1.1 旧库在线迁移**（封存列补齐、周期默认未封存、迁移幂等）。
 
-## 升级与数据迁移（v1.0 → v1.1）
+## 升级与数据迁移
+
+### v1.1 → v1.2（周期封存）
+
+- 沿用原启动方式（`python3 -m app` / Docker / Compose），服务启动时自动在线迁移，无需手工操作；
+- `cycles` 表补登 `sealed` / `sealed_at` / `fingerprint` 三列：**旧库周期一律默认未封存**，封存时间与指纹为空，未封存周期的写入、发布、查询等原有行为完全保持；
+- 迁移幂等（重复启动安全）；封存列不涉及已发布版本快照，`format_rev` 不变，**已发布版本查询结果与升级前逐字段一致**；
+- 现场核对后按"先 GET 取指纹、再 POST seal"的新流程即可使用封存；新库周期同样默认未封存。
+
+### v1.0 → v1.1（时钟周期）
 
 - 沿用原启动方式（`python3 -m app` / Docker / Compose），服务启动时自动识别并在线迁移旧库，无需手工操作；
 - 旧设备自动补登 `default` 周期；旧锚点与声段一律归入 `default`；旧声段内容指纹按含周期的新口径重算（默认周期同内容重传仍为幂等）；
@@ -284,7 +364,8 @@ app/
   db.py         # SQLite 连接、建表、v1 旧库迁移、事务助手（WAL）
 tests/test_api.py      # 端到端测试（原有能力，保持兼容）
 tests/test_cycles.py   # 端到端测试（时钟周期 + 旧库迁移/旧版本不变）
-examples/demo.sh       # curl 调用示例（含周期用法）
-examples/client.py     # Python 客户端示例（含周期用法）
+tests/test_seals.py    # 端到端测试（周期封存：指纹/封存/写拦截/迁移）
+examples/demo.sh       # curl 调用示例（含周期与封存用法）
+examples/client.py     # Python 客户端示例（含周期与封存用法）
 Dockerfile / docker-compose.yml
 ```

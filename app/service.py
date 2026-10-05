@@ -13,9 +13,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from . import db
-from .logic import (ApiError, DEFAULT_CYCLE_ID, compute_changes, project_segment,
-                    require_fields, require_payload, segment_content_hash,
-                    sort_projections, validate_cycle_id, validate_id, validate_ms,
+from .logic import (ApiError, DEFAULT_CYCLE_ID, STATUS_UNLOCATABLE, compute_changes,
+                    cycle_fingerprint, project_segment, require_fields,
+                    require_payload, segment_content_hash, sort_projections,
+                    validate_cycle_id, validate_fingerprint, validate_id, validate_ms,
                     validate_note)
 from .db import SCHEMA_VERSION
 
@@ -55,6 +56,82 @@ def _cycles_of(conn, device_id: str) -> list[dict]:
         "SELECT device_id, cycle_id, note, created_at FROM cycles "
         "WHERE device_id=? ORDER BY cycle_id", (device_id,)).fetchall()
     return [dict(r) for r in rows]
+
+
+def _cycle_current_fingerprint(conn, device_id: str, cycle_id: str) -> str:
+    """按当前库内容计算周期指纹（锚点 + 声段内容）。"""
+    anchors = conn.execute(
+        "SELECT local_ms, utc_ms FROM anchors WHERE device_id=? AND cycle_id=?",
+        (device_id, cycle_id)).fetchall()
+    segments = conn.execute(
+        "SELECT capture_id, local_start_ms, local_end_ms, note FROM segments "
+        "WHERE device_id=? AND cycle_id=?",
+        (device_id, cycle_id)).fetchall()
+    return cycle_fingerprint(device_id, cycle_id,
+                             [dict(a) for a in anchors],
+                             [dict(s) for s in segments])
+
+
+def _cycle_summary(conn, r) -> dict:
+    """周期对外条目：登记信息 + 计数 + 封存状态 + 稳定指纹。
+
+    封存周期返回封存时刻落库的指纹（内容此后不可变，与当前内容必然一致）；
+    未封存周期返回按当前内容实时计算的指纹（写入前的预检值）。
+    """
+    sealed = bool(r["sealed"])
+    if sealed:
+        fingerprint = r["fingerprint"]
+    else:
+        fingerprint = _cycle_current_fingerprint(conn, r["device_id"], r["cycle_id"])
+    return {"device_id": r["device_id"], "cycle_id": r["cycle_id"],
+            "note": r["note"], "created_at": r["created_at"],
+            "sealed": sealed, "sealed_at": r["sealed_at"],
+            "fingerprint": fingerprint,
+            "anchor_count": r["anchor_count"],
+            "segment_count": r["segment_count"]}
+
+
+_CYCLE_LIST_SQL = """
+    SELECT c.device_id AS device_id, c.cycle_id AS cycle_id, c.note AS note,
+           c.created_at AS created_at, c.sealed AS sealed, c.sealed_at AS sealed_at,
+           c.fingerprint AS fingerprint,
+           (SELECT COUNT(*) FROM anchors a
+             WHERE a.device_id = c.device_id AND a.cycle_id = c.cycle_id) AS anchor_count,
+           (SELECT COUNT(*) FROM segments s
+             WHERE s.device_id = c.device_id AND s.cycle_id = c.cycle_id) AS segment_count
+      FROM cycles c WHERE c.device_id=? ORDER BY c.cycle_id
+"""
+
+
+def _list_cycle_rows(conn, device_id: str) -> list:
+    return conn.execute(_CYCLE_LIST_SQL, (device_id,)).fetchall()
+
+
+def _get_cycle_row(conn, device_id: str, cycle_id: str):
+    """读取含封存状态的周期行；不存在抛 404。"""
+    row = conn.execute(
+        "SELECT device_id, cycle_id, note, created_at, sealed, sealed_at, fingerprint "
+        "FROM cycles WHERE device_id=? AND cycle_id=?",
+        (device_id, cycle_id)).fetchone()
+    if not row:
+        raise ApiError(404, "cycle_not_found",
+                       f"设备 {device_id} 不存在周期 {cycle_id}，"
+                       f"请先通过 POST /devices/{device_id}/cycles 登记",
+                       {"device_id": device_id, "cycle_id": cycle_id})
+    return row
+
+
+def _assert_cycle_unsealed(conn, device_id: str, cycle_id: str) -> None:
+    """封存周期拒绝一切锚点/声段写操作（幂等重传与冲突判定在调用前完成）。"""
+    state = conn.execute(
+        "SELECT sealed, sealed_at FROM cycles WHERE device_id=? AND cycle_id=?",
+        (device_id, cycle_id)).fetchone()
+    if state is not None and state["sealed"]:
+        raise ApiError(409, "cycle_sealed",
+                       f"设备 {device_id} 的周期 {cycle_id} 已于 {state['sealed_at']} 封存，"
+                       f"封存不可撤销，该周期锚点与声段均不可新增、更正或删除",
+                       {"device_id": device_id, "cycle_id": cycle_id,
+                        "sealed_at": state["sealed_at"]})
 
 
 def _anchors_of(conn, device_id: str, cycle_id: str | None = None) -> list[dict]:
@@ -237,15 +314,93 @@ def register_cycle(db_path: str, device_id: str, body):
 def list_cycles(db_path: str, device_id: str):
     with db.session(db_path) as conn, db.read_txn(conn):
         _get_device(conn, device_id)
-        rows = conn.execute(
-            """SELECT c.device_id, c.cycle_id, c.note, c.created_at,
-                      (SELECT COUNT(*) FROM anchors a
-                        WHERE a.device_id = c.device_id AND a.cycle_id = c.cycle_id) AS anchor_count,
-                      (SELECT COUNT(*) FROM segments s
-                        WHERE s.device_id = c.device_id AND s.cycle_id = c.cycle_id) AS segment_count
-               FROM cycles c WHERE c.device_id=? ORDER BY c.cycle_id""",
-            (device_id,)).fetchall()
-        return 200, {"device_id": device_id, "cycles": [dict(r) for r in rows]}
+        rows = _list_cycle_rows(conn, device_id)
+        return 200, {"device_id": device_id,
+                     "cycles": [_cycle_summary(conn, r) for r in rows]}
+
+
+def get_cycle(db_path: str, device_id: str, cycle_id: str):
+    """周期详情：登记信息、计数、封存状态与由锚点+声段内容生成的稳定指纹。"""
+    with db.session(db_path) as conn, db.read_txn(conn):
+        _get_device(conn, device_id)
+        rows = [r for r in _list_cycle_rows(conn, device_id)
+                if r["cycle_id"] == cycle_id]
+        if not rows:
+            raise ApiError(404, "cycle_not_found",
+                           f"设备 {device_id} 不存在周期 {cycle_id}，"
+                           f"请先通过 POST /devices/{device_id}/cycles 登记",
+                           {"device_id": device_id, "cycle_id": cycle_id})
+        summary = _cycle_summary(conn, rows[0])
+        seg_rows = conn.execute(
+            "SELECT * FROM segments WHERE device_id=? AND cycle_id=?",
+            (device_id, cycle_id)).fetchall()
+        projs = _project_all(conn, seg_rows)
+        unlocatable = [p["capture_id"] for p in projs
+                       if p["status"] == STATUS_UNLOCATABLE]
+        summary["unlocatable_count"] = len(unlocatable)
+        summary["unlocatable_captures"] = unlocatable
+        return 200, {"cycle": summary}
+
+
+def seal_cycle(db_path: str, device_id: str, cycle_id: str, body):
+    """封存单台设备的一个时钟周期。
+
+    - 请求必须携带 fingerprint（取自 GET 周期详情）；
+    - 同一写事务内核对当前内容指纹：不一致（指纹过期或内容已被晚到记录改动）→
+      409 fingerprint_mismatch，状态不变；
+    - 该周期存在不可定位声段 → 409 cycle_not_sealable，状态不变；
+    - 通过后封存生效（不可撤销），返回封存时间与最终指纹；
+    - 已封存周期重复请求：相同指纹 → 幂等返回首次封存结果（200），
+      不同指纹 → 409 fingerprint_mismatch。
+    """
+    payload = require_payload(body)
+    require_fields(payload, ["fingerprint"])
+    claimed = validate_fingerprint(payload["fingerprint"])
+    with db.session(db_path) as conn:
+        with db.write_txn(conn):
+            _get_device(conn, device_id)
+            row = _get_cycle_row(conn, device_id, cycle_id)
+            if row["sealed"]:
+                if claimed == row["fingerprint"]:
+                    return 200, {
+                        "device_id": device_id, "cycle_id": cycle_id,
+                        "sealed": True, "sealed_at": row["sealed_at"],
+                        "fingerprint": row["fingerprint"],
+                        "idempotent_replay": True}
+                raise ApiError(409, "fingerprint_mismatch",
+                               f"周期 {cycle_id} 已封存；携带的指纹与封存指纹不一致，"
+                               f"封存不可撤销",
+                               {"device_id": device_id, "cycle_id": cycle_id,
+                                "sealed_fingerprint": row["fingerprint"],
+                                "received_fingerprint": claimed})
+            current = _cycle_current_fingerprint(conn, device_id, cycle_id)
+            if claimed != current:
+                raise ApiError(409, "fingerprint_mismatch",
+                               f"携带的指纹与周期 {cycle_id} 当前内容不一致"
+                               f"（指纹过期或内容已被改动），拒绝封存，状态不变",
+                               {"device_id": device_id, "cycle_id": cycle_id,
+                                "current_fingerprint": current,
+                                "received_fingerprint": claimed})
+            seg_rows = conn.execute(
+                "SELECT * FROM segments WHERE device_id=? AND cycle_id=?",
+                (device_id, cycle_id)).fetchall()
+            projs = _project_all(conn, seg_rows)
+            unlocatable = sorted(p["capture_id"] for p in projs
+                                 if p["status"] == STATUS_UNLOCATABLE)
+            if unlocatable:
+                raise ApiError(409, "cycle_not_sealable",
+                               f"周期 {cycle_id} 存在 {len(unlocatable)} 个无法定位的声段，"
+                               f"全部声段可定位后方可封存，拒绝封存，状态不变",
+                               {"device_id": device_id, "cycle_id": cycle_id,
+                                "unlocatable_captures": unlocatable})
+            now = iso_now()
+            conn.execute(
+                "UPDATE cycles SET sealed=1, sealed_at=?, fingerprint=? "
+                "WHERE device_id=? AND cycle_id=?",
+                (now, current, device_id, cycle_id))
+            return 201, {"device_id": device_id, "cycle_id": cycle_id,
+                         "sealed": True, "sealed_at": now,
+                         "fingerprint": current, "idempotent_replay": False}
 
 
 # ---------------------------------------------------------------- 锚点
@@ -269,6 +424,7 @@ def add_anchor(db_path: str, device_id: str, body):
         with db.write_txn(conn):
             _get_device(conn, device_id)
             _get_cycle(conn, device_id, cycle_id)
+            _assert_cycle_unsealed(conn, device_id, cycle_id)
             _check_insert_increasing(_anchors_of(conn, device_id, cycle_id), local_ms, utc_ms)
             now = iso_now()
             conn.execute(
@@ -328,6 +484,9 @@ def replace_anchors(db_path: str, device_id: str, body):
             _get_device(conn, device_id)
             for cyc in validated:
                 _get_cycle(conn, device_id, cyc)
+            # 一次更正涉及已封存周期 -> 整体拒绝（任何删除/写入之前），其他周期不受影响
+            for cyc in validated:
+                _assert_cycle_unsealed(conn, device_id, cyc)
             # 先删除所有被引用周期的旧锚点，再整批插入
             for cyc, pairs in validated.items():
                 conn.execute("DELETE FROM anchors WHERE device_id=? AND cycle_id=?",
@@ -354,6 +513,7 @@ def delete_anchor(db_path: str, device_id: str, local_ms: int, cycle_id: str):
         with db.write_txn(conn):
             _get_device(conn, device_id)
             _get_cycle(conn, device_id, cycle_id)
+            _assert_cycle_unsealed(conn, device_id, cycle_id)
             cur = conn.execute(
                 "DELETE FROM anchors WHERE device_id=? AND cycle_id=? AND local_ms=?",
                 (device_id, cycle_id, local_ms))
@@ -408,6 +568,8 @@ def submit_segment(db_path: str, body):
                                              "cycle_id": cycle_id,
                                              "local_start_ms": start, "local_end_ms": end,
                                              "note": note}})
+            # 新声段写入前：目标周期已封存则拒绝（同内容重传/异内容冲突已在上面判定）
+            _assert_cycle_unsealed(conn, device_id, cycle_id)
             now = iso_now()
             conn.execute(
                 """INSERT INTO segments(capture_id, device_id, cycle_id,
@@ -462,10 +624,14 @@ def get_segment(db_path: str, capture_id: str):
 def delete_segment(db_path: str, capture_id: str):
     with db.session(db_path) as conn:
         with db.write_txn(conn):
-            cur = conn.execute("DELETE FROM segments WHERE capture_id=?", (capture_id,))
-            if cur.rowcount == 0:
+            row = conn.execute("SELECT device_id, cycle_id FROM segments "
+                               "WHERE capture_id=?", (capture_id,)).fetchone()
+            if not row:
                 raise ApiError(404, "capture_not_found",
                                f"采集编号 {capture_id} 不存在", {"capture_id": capture_id})
+            # 声段所属周期已封存 -> 拒绝删除（封存时间线不可改动）
+            _assert_cycle_unsealed(conn, row["device_id"], row["cycle_id"])
+            conn.execute("DELETE FROM segments WHERE capture_id=?", (capture_id,))
     return 200, {"deleted": capture_id}
 
 

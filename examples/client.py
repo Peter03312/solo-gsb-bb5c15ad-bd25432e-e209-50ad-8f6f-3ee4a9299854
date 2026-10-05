@@ -46,6 +46,15 @@ class TimelineClient:
     def list_cycles(self, device_id: str):
         return self._call("GET", f"/devices/{device_id}/cycles")
 
+    def cycle(self, device_id: str, cycle_id: str):
+        """周期详情：封存状态、稳定指纹、不可定位声段清单。"""
+        return self._call("GET", f"/devices/{device_id}/cycles/{cycle_id}")
+
+    def seal_cycle(self, device_id: str, cycle_id: str, fingerprint: str):
+        """封存周期：携带 GET 周期详情返回的 fingerprint（单事务核对内容）。"""
+        return self._call("POST", f"/devices/{device_id}/cycles/{cycle_id}/seal",
+                          {"fingerprint": fingerprint})
+
     # 锚点
     def add_anchor(self, device_id: str, local_ms: int, utc_ms: int,
                    cycle_id: str | None = None):
@@ -76,6 +85,9 @@ class TimelineClient:
     # 时间轴与版本
     def timeline(self):
         return self._call("GET", "/timeline/current")
+
+    def delete_segment(self, capture_id: str):
+        return self._call("DELETE", f"/segments/{capture_id}")
 
     def publish(self, note: str | None = None):
         return self._call("POST", "/versions", {"note": note} if note else None)
@@ -151,6 +163,49 @@ def main() -> None:
 
     # 10. 发布 v3：各周期锚点与声段投影原子冻结，文档带 cycle_id / format_rev=2
     show("发布 v3（双周期冻结）", *cli.publish("加入重启周期"))
+
+    # 11. 现场核对完成后封存周期：先取周期详情（稳定指纹/封存状态/可定位性）
+    #     D1 的 default 周期含越界声段 CAP-0003（unlocatable）-> 封存被拒
+    status, detail_d1 = cli.cycle("D1", "default")
+    show("D1 default 周期详情（含不可定位声段）", status, detail_d1)
+    show("封存 D1 default（409：存在不可定位声段）",
+         *cli.seal_cycle("D1", "default", detail_d1["cycle"]["fingerprint"]))
+
+    #     改封存 D1 的 boot-2 周期（CAP-0100 可定位）
+    _, detail = cli.cycle("D1", "boot-2")
+    stale_fp = detail["cycle"]["fingerprint"]
+    # 晚到一条锚点 -> 旧指纹过期
+    show("封存前补录锚点（内容变化，指纹随之变化）",
+         *cli.add_anchor("D1", 30000, 1700010030000, cycle_id="boot-2"))
+    show("携带过期指纹封存（409 fingerprint_mismatch，状态不变）",
+         *cli.seal_cycle("D1", "boot-2", stale_fp))
+
+    # 12. 重新核对、取最新指纹后封存生效：返回封存时间与最终指纹
+    _, detail = cli.cycle("D1", "boot-2")
+    show("封存 boot-2 周期（201）",
+         *cli.seal_cycle("D1", "boot-2", detail["cycle"]["fingerprint"]))
+    fp = detail["cycle"]["fingerprint"]
+
+    # 13. 重复相同封存请求 -> 返回首次结果（200 幂等，sealed_at 与首次一致）
+    show("重复相同封存请求(幂等)", *cli.seal_cycle("D1", "boot-2", fp))
+
+    # 14. 封存后晚到记录一律拒绝（409 cycle_sealed，封存不可撤销）
+    show("封存后补锚点(409)",
+         *cli.add_anchor("D1", 40000, 1700010040000, cycle_id="boot-2"))
+    show("封存后删声段(409)", *cli.delete_segment("CAP-0100"))
+    show("封存后更正锚点(409，涉及封存周期即整体拒绝)",
+         *cli.replace_anchors("D1", [
+             {"cycle_id": "boot-2", "local_ms": 1000, "utc_ms": 1700010000999},
+             {"cycle_id": "boot-2", "local_ms": 61000, "utc_ms": 1700010060999},
+         ]))
+
+    # 15. 同内容声段重传仍幂等、异内容仍冲突（既有规则不变，均不产生写入）
+    show("同内容重传(仍 200 幂等)",
+         *cli.submit_segment("CAP-0100", "D1", 5000, 20000,
+                             note="重启后录制", cycle_id="boot-2"))
+    show("异内容重传(仍 409 冲突)",
+         *cli.submit_segment("CAP-0100", "D1", 5000, 20001,
+                             note="重启后录制", cycle_id="boot-2"))
 
 
 if __name__ == "__main__":

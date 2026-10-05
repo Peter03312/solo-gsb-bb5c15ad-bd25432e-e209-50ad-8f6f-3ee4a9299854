@@ -19,6 +19,7 @@ from bisect import bisect_left
 
 MAX_INT64 = 2 ** 63 - 1
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}$")
+FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
 
 STATUS_LOCATED = "located"
 STATUS_UNLOCATABLE = "unlocatable"
@@ -163,6 +164,37 @@ def segment_content_hash(capture_id: str, device_id: str, cycle_id: str,
         {"capture_id": capture_id, "device_id": device_id, "cycle_id": cycle_id,
          "local_start_ms": local_start_ms, "local_end_ms": local_end_ms,
          "note": note},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def validate_fingerprint(value) -> str:
+    """封存指纹必须是 64 位小写十六进制（sha256 hex）。"""
+    if not isinstance(value, str) or not FINGERPRINT_RE.match(value):
+        raise ApiError(400, "validation_error",
+                       "fingerprint 必须是 64 位小写十六进制 SHA-256 指纹",
+                       {"value": value})
+    return value
+
+
+def cycle_fingerprint(device_id: str, cycle_id: str,
+                      anchors: list[dict], segments: list[dict]) -> str:
+    """周期内容稳定指纹：由该周期锚点及全部声段内容生成。
+
+    - 锚点按 local_ms 升序参与（锚点 local_ms 在周期内唯一），声段按 capture_id 升序；
+    - 锚点取 (local_ms, utc_ms)，声段取内容字段（采集编号、本地起止、note）；
+    - 不含随锚点更正而重算的 UTC 投影，也不含 created_at 等登记元数据；
+    - 任何锚点或声段内容变动都会改变指纹，封存请求据此核对"当前内容"。
+    """
+    canonical = json.dumps(
+        {"device_id": device_id, "cycle_id": cycle_id,
+         "anchors": [{"local_ms": a["local_ms"], "utc_ms": a["utc_ms"]}
+                     for a in sorted(anchors, key=lambda a: a["local_ms"])],
+         "segments": [{"capture_id": s["capture_id"],
+                       "local_start_ms": s["local_start_ms"],
+                       "local_end_ms": s["local_end_ms"],
+                       "note": s["note"]}
+                      for s in sorted(segments, key=lambda s: s["capture_id"])]},
         sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 

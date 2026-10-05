@@ -12,7 +12,9 @@
 - segments / version_* 带 cycle_id 归属；
 - versions.format_rev 标记快照格式：1=旧版（无周期字段，查询结果保持原样），
   2=周期版（锚点与声段投影带 cycle_id）。
-- init_db 同时负责把 v1 旧库在线迁移到周期版结构（旧数据归入 default 周期）。
+- cycles 带封存列（sealed/sealed_at/fingerprint）：封存后该周期锚点与声段不可变更。
+- init_db 同时负责把 v1 旧库在线迁移到周期版结构（旧数据归入 default 周期），
+  并为 v1.1 周期库补登封存列（旧周期默认未封存）。
 """
 from __future__ import annotations
 
@@ -35,6 +37,9 @@ CREATE TABLE IF NOT EXISTS cycles (
     cycle_id    TEXT NOT NULL,
     note        TEXT,
     created_at  TEXT NOT NULL,
+    sealed      INTEGER NOT NULL DEFAULT 0,   -- 是否封存：0=未封存，1=已封存（不可撤销）
+    sealed_at   TEXT,                        -- 封存时间（UTC ISO8601）
+    fingerprint TEXT,                        -- 封存时刻内容指纹（封存后不可变）
     PRIMARY KEY (device_id, cycle_id)
 );
 
@@ -198,6 +203,23 @@ def _migrate_legacy(conn: sqlite3.Connection) -> bool:
     return True
 
 
+def _migrate_seal_columns(conn: sqlite3.Connection) -> None:
+    """v1.2：为 v1.1 周期库的 cycles 表补登封存列。
+
+    旧库周期一律默认未封存（sealed=0，封存时间/指纹为空）；
+    空库或已含封存列时为空操作。封存列不改变已发布版本快照格式。
+    """
+    cycle_cols = _columns(conn, "cycles")
+    if not cycle_cols:
+        return
+    if "sealed" not in cycle_cols:
+        conn.execute("ALTER TABLE cycles ADD COLUMN sealed INTEGER NOT NULL DEFAULT 0")
+    if "sealed_at" not in cycle_cols:
+        conn.execute("ALTER TABLE cycles ADD COLUMN sealed_at TEXT")
+    if "fingerprint" not in cycle_cols:
+        conn.execute("ALTER TABLE cycles ADD COLUMN fingerprint TEXT")
+
+
 def init_db(db_path: str) -> None:
     """初始化数据库（建表 + 旧库迁移）。服务启动时调用，幂等。"""
     parent = os.path.dirname(os.path.abspath(db_path))
@@ -208,6 +230,7 @@ def init_db(db_path: str) -> None:
         conn.execute("BEGIN IMMEDIATE")
         try:
             _migrate_legacy(conn)
+            _migrate_seal_columns(conn)
             conn.execute("COMMIT")
         except BaseException:
             conn.execute("ROLLBACK")

@@ -49,7 +49,9 @@ def h_root(ctx, body, query):
             "GET    /devices",
             "GET    /devices/{device_id}",
             "POST   /devices/{device_id}/cycles                    # 登记时钟周期（重启轮次）",
-            "GET    /devices/{device_id}/cycles",
+            "GET    /devices/{device_id}/cycles                    # 周期列表（含封存状态与稳定指纹）",
+            "GET    /devices/{device_id}/cycles/{cycle_id}         # 周期详情（指纹/封存状态/不可定位声段）",
+            "POST   /devices/{device_id}/cycles/{cycle_id}/seal    # 封存周期 {\"fingerprint\": \"...\"}",
             "POST   /devices/{device_id}/anchors                   # body 可带 cycle_id，省略=default",
             "GET    /devices/{device_id}/anchors                   # 可加 ?cycle_id= 过滤",
             "PUT    /devices/{device_id}/anchors            # 锚点更正（按周期整体替换）",
@@ -88,6 +90,16 @@ def h_register_cycle(ctx, body, query, device_id):
 
 def h_list_cycles(ctx, body, query, device_id):
     return service.list_cycles(ctx.db_path, device_id)
+
+
+def h_get_cycle(ctx, body, query, device_id, cycle_id):
+    return service.get_cycle(ctx.db_path, device_id,
+                             validate_id(cycle_id, "cycle_id"))
+
+
+def h_seal_cycle(ctx, body, query, device_id, cycle_id):
+    return service.seal_cycle(ctx.db_path, device_id,
+                              validate_id(cycle_id, "cycle_id"), body)
 
 
 def h_add_anchor(ctx, body, query, device_id):
@@ -155,6 +167,8 @@ ROUTES = [
     ("GET", r"^/devices/(?P<device_id>[^/]+)$", h_get_device),
     ("POST", r"^/devices/(?P<device_id>[^/]+)/cycles$", h_register_cycle),
     ("GET", r"^/devices/(?P<device_id>[^/]+)/cycles$", h_list_cycles),
+    ("GET", r"^/devices/(?P<device_id>[^/]+)/cycles/(?P<cycle_id>[^/]+)$", h_get_cycle),
+    ("POST", r"^/devices/(?P<device_id>[^/]+)/cycles/(?P<cycle_id>[^/]+)/seal$", h_seal_cycle),
     ("POST", r"^/devices/(?P<device_id>[^/]+)/anchors$", h_add_anchor),
     ("GET", r"^/devices/(?P<device_id>[^/]+)/anchors$", h_list_anchors),
     ("PUT", r"^/devices/(?P<device_id>[^/]+)/anchors$", h_replace_anchors),

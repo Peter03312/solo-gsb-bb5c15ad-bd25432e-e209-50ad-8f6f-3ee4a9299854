@@ -117,3 +117,58 @@ curl -s -X POST "$BASE/versions" | pp
 
 echo; echo "== 回看 v3：各周期冻结不变 =="
 curl -s "$BASE/versions/3" | pp
+
+# ----------------------------------------------------------------------
+# 周期封存（seal）：现场核对完成后封存单台设备的一个时钟周期，
+# 防止晚到记录改动已确认时间线（封存不可撤销）
+# ----------------------------------------------------------------------
+
+echo; echo "== 周期详情：返回稳定指纹、封存状态、不可定位声段清单 =="
+curl -s "$BASE/devices/D1/cycles/default" | pp
+
+echo; echo "== D1 default 含越界声段 CAP-0003 -> 封存被拒（409 cycle_not_sealable）=="
+FP_D1=$(curl -s "$BASE/devices/D1/cycles/default" | python3 -c \
+  'import sys,json;print(json.load(sys.stdin)["cycle"]["fingerprint"])')
+curl -s -X POST "$BASE/devices/D1/cycles/default/seal" -H 'Content-Type: application/json' \
+  -d "{\"fingerprint\":\"$FP_D1\"}" | pp
+
+echo; echo "== 改封存 D2 的 boot-2（CAP-0101 可定位）：先取指纹 =="
+FP=$(curl -s "$BASE/devices/D2/cycles/boot-2" | python3 -c \
+  'import sys,json;print(json.load(sys.stdin)["cycle"]["fingerprint"])')
+echo "当前指纹: $FP"
+
+echo; echo "== 携带过期指纹封存 -> 409 fingerprint_mismatch，状态不变 =="
+curl -s -X POST "$BASE/devices/D2/cycles/boot-2/seal" -H 'Content-Type: application/json' \
+  -d '{"fingerprint":"0000000000000000000000000000000000000000000000000000000000000000"}' | pp
+
+echo; echo "== 携带正确指纹封存 -> 201，返回封存时间与最终指纹 =="
+curl -s -X POST "$BASE/devices/D2/cycles/boot-2/seal" -H 'Content-Type: application/json' \
+  -d "{\"fingerprint\":\"$FP\"}" | pp
+
+echo; echo "== 重复相同封存请求 -> 200 幂等，返回首次封存时间 =="
+curl -s -X POST "$BASE/devices/D2/cycles/boot-2/seal" -H 'Content-Type: application/json' \
+  -d "{\"fingerprint\":\"$FP\"}" | pp
+
+echo; echo "== 封存后补锚点 -> 409 cycle_sealed =="
+curl -s -X POST "$BASE/devices/D2/anchors" -H 'Content-Type: application/json' \
+  -d '{"cycle_id":"boot-2","local_ms":30000,"utc_ms":1700010030000}' | pp
+
+echo; echo "== 封存后删锚点 / 删声段 -> 409 cycle_sealed =="
+curl -s -X DELETE "$BASE/devices/D2/anchors/0?cycle_id=boot-2" | pp
+curl -s -X DELETE "$BASE/segments/CAP-0101" | pp
+
+echo; echo "== 锚点更正涉及封存周期 -> 409 整体拒绝（default 等其他周期不受影响）=="
+curl -s -X PUT "$BASE/devices/D2/anchors" -H 'Content-Type: application/json' \
+  -d '{"anchors":[{"cycle_id":"boot-2","local_ms":0,"utc_ms":1700010000001}]}' | pp
+echo "-- 同一次更正只涉及 default（未封存）仍成功 --"
+curl -s -X PUT "$BASE/devices/D2/anchors" -H 'Content-Type: application/json' \
+  -d '{"anchors":[{"cycle_id":"default","local_ms":0,"utc_ms":1699999997500},{"local_ms":60000,"utc_ms":1700000057500}]}' | pp
+
+echo; echo "== 同内容声段重传仍 200 幂等；异内容仍 409 冲突（均不写入）=="
+curl -s -X POST "$BASE/segments" -H 'Content-Type: application/json' \
+  -d '{"capture_id":"CAP-0101","device_id":"D2","cycle_id":"boot-2","local_start_ms":3000,"local_end_ms":9000,"note":"重启后录制"}' | pp
+curl -s -X POST "$BASE/segments" -H 'Content-Type: application/json' \
+  -d '{"capture_id":"CAP-0101","device_id":"D2","cycle_id":"boot-2","local_start_ms":3000,"local_end_ms":9001,"note":"重启后录制"}' | pp
+
+echo; echo "== 封存后周期详情：sealed=true，指纹为封存指纹（不可变）=="
+curl -s "$BASE/devices/D2/cycles/boot-2" | pp
