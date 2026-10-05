@@ -7,16 +7,22 @@
 "设备内唯一"的时钟周期。省略 cycle_id 时一律归入 default 默认周期；
 锚点递增校验与线性漂移映射均按 (设备, 周期) 独立执行；声段投影只使用
 其所属周期的锚点。
+
+周期封存（seal）：现场核对完成后可封存单个周期——封存请求携带周期详情
+中的内容指纹，在同一事务内核对当前内容且全部声段可定位才生效；封存后
+该周期的锚点/声段变更一律拒绝（同内容声段重传仍按幂等规则返回），
+封存不可撤销。
 """
 from __future__ import annotations
 
 from datetime import datetime, timezone
 
 from . import db
-from .logic import (ApiError, DEFAULT_CYCLE_ID, compute_changes, project_segment,
+from .logic import (ApiError, DEFAULT_CYCLE_ID, STATUS_UNLOCATABLE,
+                    compute_changes, cycle_fingerprint, project_segment,
                     require_fields, require_payload, segment_content_hash,
-                    sort_projections, validate_cycle_id, validate_id, validate_ms,
-                    validate_note)
+                    sort_projections, validate_cycle_id, validate_fingerprint,
+                    validate_id, validate_ms, validate_note)
 from .db import SCHEMA_VERSION
 
 
@@ -39,8 +45,8 @@ def _get_device(conn, device_id: str) -> dict:
 
 def _get_cycle(conn, device_id: str, cycle_id: str) -> dict:
     row = conn.execute(
-        "SELECT device_id, cycle_id, note, created_at FROM cycles "
-        "WHERE device_id=? AND cycle_id=?",
+        "SELECT device_id, cycle_id, note, sealed_at, seal_fingerprint, created_at "
+        "FROM cycles WHERE device_id=? AND cycle_id=?",
         (device_id, cycle_id)).fetchone()
     if not row:
         raise ApiError(404, "cycle_not_found",
@@ -50,11 +56,27 @@ def _get_cycle(conn, device_id: str, cycle_id: str) -> dict:
     return dict(row)
 
 
+def _raise_if_sealed(cycle: dict) -> None:
+    """周期已封存 -> 409：该周期锚点与声段已冻结，拒绝一切变更（封存不可撤销）。"""
+    if cycle.get("sealed_at") is not None:
+        raise ApiError(
+            409, "cycle_sealed",
+            f"设备 {cycle['device_id']} 的周期 {cycle['cycle_id']} "
+            f"已于 {cycle['sealed_at']} 封存，该周期的锚点与声段已冻结，拒绝变更",
+            {"device_id": cycle["device_id"], "cycle_id": cycle["cycle_id"],
+             "sealed_at": cycle["sealed_at"]})
+
+
 def _cycles_of(conn, device_id: str) -> list[dict]:
     rows = conn.execute(
-        "SELECT device_id, cycle_id, note, created_at FROM cycles "
+        "SELECT device_id, cycle_id, note, sealed_at, created_at FROM cycles "
         "WHERE device_id=? ORDER BY cycle_id", (device_id,)).fetchall()
-    return [dict(r) for r in rows]
+    cycles = []
+    for r in rows:
+        d = dict(r)
+        d["sealed"] = d["sealed_at"] is not None
+        cycles.append(d)
+    return cycles
 
 
 def _anchors_of(conn, device_id: str, cycle_id: str | None = None) -> list[dict]:
@@ -85,6 +107,23 @@ def _anchors_map(conn) -> dict:
         pair[0].append(r["local_ms"])
         pair[1].append(r["utc_ms"])
     return m
+
+
+def _cycle_contents(conn, device_id: str, cycle_id: str):
+    """读取周期当前内容：锚点（按 local_ms 升序）与声段（按 capture_id 升序）。
+
+    排序固定，因此同一内容算出的周期指纹稳定。
+    """
+    anchors = _anchors_of(conn, device_id, cycle_id)
+    seg_rows = conn.execute(
+        "SELECT * FROM segments WHERE device_id=? AND cycle_id=? ORDER BY capture_id",
+        (device_id, cycle_id)).fetchall()
+    return anchors, [_row_to_segment(r) for r in seg_rows]
+
+
+def _cycle_content_fingerprint(conn, device_id: str, cycle_id: str) -> str:
+    anchors, segs = _cycle_contents(conn, device_id, cycle_id)
+    return cycle_fingerprint(device_id, cycle_id, anchors, segs)
 
 
 def _row_to_segment(row) -> dict:
@@ -238,14 +277,105 @@ def list_cycles(db_path: str, device_id: str):
     with db.session(db_path) as conn, db.read_txn(conn):
         _get_device(conn, device_id)
         rows = conn.execute(
-            """SELECT c.device_id, c.cycle_id, c.note, c.created_at,
+            """SELECT c.device_id, c.cycle_id, c.note, c.created_at, c.sealed_at,
                       (SELECT COUNT(*) FROM anchors a
                         WHERE a.device_id = c.device_id AND a.cycle_id = c.cycle_id) AS anchor_count,
                       (SELECT COUNT(*) FROM segments s
                         WHERE s.device_id = c.device_id AND s.cycle_id = c.cycle_id) AS segment_count
                FROM cycles c WHERE c.device_id=? ORDER BY c.cycle_id""",
             (device_id,)).fetchall()
-        return 200, {"device_id": device_id, "cycles": [dict(r) for r in rows]}
+        cycles = []
+        for r in rows:
+            d = dict(r)
+            d["sealed"] = d["sealed_at"] is not None
+            cycles.append(d)
+        return 200, {"device_id": device_id, "cycles": cycles}
+
+
+def get_cycle_detail(db_path: str, device_id: str, cycle_id: str):
+    """周期详情：内容稳定指纹 + 封存状态。
+
+    指纹由该周期当前全部锚点与声段内容生成；已封存周期返回封存时核对的
+    最终指纹（内容已冻结，与实时重算一致）。
+    """
+    with db.session(db_path) as conn, db.read_txn(conn):
+        _get_device(conn, device_id)
+        cycle = _get_cycle(conn, device_id, cycle_id)
+        anchors, segs = _cycle_contents(conn, device_id, cycle_id)
+        sealed = cycle["sealed_at"] is not None
+        fingerprint = (cycle["seal_fingerprint"] if sealed
+                       else cycle_fingerprint(device_id, cycle_id, anchors, segs))
+        return 200, {"cycle": {
+            "device_id": device_id, "cycle_id": cycle_id,
+            "note": cycle["note"], "created_at": cycle["created_at"],
+            "anchor_count": len(anchors), "segment_count": len(segs),
+            "sealed": sealed, "sealed_at": cycle["sealed_at"],
+            "fingerprint": fingerprint}}
+
+
+def seal_cycle(db_path: str, device_id: str, cycle_id: str, body):
+    """封存设备的一个时钟周期（现场核对完成后执行，不可撤销）。
+
+    - 请求必须携带从周期详情获取的内容指纹；在同一写事务内重算当前指纹并
+      比对，不一致（内容已变化、指纹过期）-> 409，状态不变；
+    - 该周期存在不可定位声段 -> 409，状态不变；
+    - 生效后返回封存时间与最终指纹；重复相同封存请求返回首次结果（幂等）；
+    - 封存后该周期的锚点/声段变更一律拒绝（见各写接口的 cycle_sealed）。
+    """
+    payload = require_payload(body)
+    require_fields(payload, ["fingerprint"])
+    fingerprint = validate_fingerprint(payload["fingerprint"])
+    with db.session(db_path) as conn:
+        with db.write_txn(conn):
+            _get_device(conn, device_id)
+            cycle = _get_cycle(conn, device_id, cycle_id)
+            if cycle["sealed_at"] is not None:
+                # 已封存：相同指纹 -> 返回首次封存结果；不同指纹 -> 过期拒绝
+                if fingerprint == cycle["seal_fingerprint"]:
+                    return 200, {"cycle": {
+                        "device_id": device_id, "cycle_id": cycle_id,
+                        "sealed": True, "sealed_at": cycle["sealed_at"],
+                        "fingerprint": cycle["seal_fingerprint"]},
+                        "idempotent_replay": True}
+                raise ApiError(
+                    409, "seal_fingerprint_stale",
+                    f"周期 {cycle_id} 已于 {cycle['sealed_at']} 封存，"
+                    f"请求指纹与封存指纹不一致，拒绝重复封存",
+                    {"device_id": device_id, "cycle_id": cycle_id,
+                     "sealed_at": cycle["sealed_at"],
+                     "sealed_fingerprint": cycle["seal_fingerprint"]})
+            # 同一事务内核对当前内容：指纹过期（内容已被晚到记录改动）即拒绝
+            anchors, segs = _cycle_contents(conn, device_id, cycle_id)
+            current = cycle_fingerprint(device_id, cycle_id, anchors, segs)
+            if fingerprint != current:
+                raise ApiError(
+                    409, "seal_fingerprint_stale",
+                    f"请求指纹与设备 {device_id} 周期 {cycle_id} 的当前内容不一致"
+                    f"（内容已变化，指纹过期），请重新获取周期详情后再封存",
+                    {"device_id": device_id, "cycle_id": cycle_id,
+                     "current_fingerprint": current})
+            # 全部声段均可定位才允许封存
+            pair = ([a["local_ms"] for a in anchors],
+                    [a["utc_ms"] for a in anchors])
+            unlocatable = [s["capture_id"] for s in segs
+                           if project_segment(s, pair)["status"] == STATUS_UNLOCATABLE]
+            if unlocatable:
+                raise ApiError(
+                    409, "seal_unlocatable_segments",
+                    f"设备 {device_id} 周期 {cycle_id} 存在 {len(unlocatable)} 段"
+                    f"无法定位的声段，须先补齐锚点或移除这些声段才能封存",
+                    {"device_id": device_id, "cycle_id": cycle_id,
+                     "unlocatable_capture_ids": unlocatable})
+            now = iso_now()
+            conn.execute(
+                "UPDATE cycles SET sealed_at=?, seal_fingerprint=? "
+                "WHERE device_id=? AND cycle_id=?",
+                (now, current, device_id, cycle_id))
+            return 201, {"cycle": {
+                "device_id": device_id, "cycle_id": cycle_id,
+                "sealed": True, "sealed_at": now,
+                "fingerprint": current},
+                "idempotent_replay": False}
 
 
 # ---------------------------------------------------------------- 锚点
@@ -268,7 +398,8 @@ def add_anchor(db_path: str, device_id: str, body):
     with db.session(db_path) as conn:
         with db.write_txn(conn):
             _get_device(conn, device_id)
-            _get_cycle(conn, device_id, cycle_id)
+            cycle = _get_cycle(conn, device_id, cycle_id)
+            _raise_if_sealed(cycle)
             _check_insert_increasing(_anchors_of(conn, device_id, cycle_id), local_ms, utc_ms)
             now = iso_now()
             conn.execute(
@@ -326,8 +457,9 @@ def replace_anchors(db_path: str, device_id: str, body):
     with db.session(db_path) as conn:
         with db.write_txn(conn):
             _get_device(conn, device_id)
+            # 任一引用周期已封存 -> 整体拒绝，其他周期不受影响（不写入）
             for cyc in validated:
-                _get_cycle(conn, device_id, cyc)
+                _raise_if_sealed(_get_cycle(conn, device_id, cyc))
             # 先删除所有被引用周期的旧锚点，再整批插入
             for cyc, pairs in validated.items():
                 conn.execute("DELETE FROM anchors WHERE device_id=? AND cycle_id=?",
@@ -353,7 +485,8 @@ def delete_anchor(db_path: str, device_id: str, local_ms: int, cycle_id: str):
     with db.session(db_path) as conn:
         with db.write_txn(conn):
             _get_device(conn, device_id)
-            _get_cycle(conn, device_id, cycle_id)
+            cycle = _get_cycle(conn, device_id, cycle_id)
+            _raise_if_sealed(cycle)
             cur = conn.execute(
                 "DELETE FROM anchors WHERE device_id=? AND cycle_id=? AND local_ms=?",
                 (device_id, cycle_id, local_ms))
@@ -392,10 +525,12 @@ def submit_segment(db_path: str, body):
     with db.session(db_path) as conn:
         with db.write_txn(conn):
             _get_device(conn, device_id)
-            _get_cycle(conn, device_id, cycle_id)
+            cycle = _get_cycle(conn, device_id, cycle_id)
             row = conn.execute("SELECT * FROM segments WHERE capture_id=?",
                                (capture_id,)).fetchone()
             if row:
+                # 同内容重传 / 异内容冲突：按现有幂等与冲突规则处理，
+                # 即使所属周期已封存也不改变这两条规则（内容并未被修改）
                 if row["content_hash"] == digest:
                     proj = project_segment(
                         _row_to_segment(row),
@@ -408,6 +543,8 @@ def submit_segment(db_path: str, body):
                                              "cycle_id": cycle_id,
                                              "local_start_ms": start, "local_end_ms": end,
                                              "note": note}})
+            # 新声段：所属周期已封存则拒绝写入
+            _raise_if_sealed(cycle)
             now = iso_now()
             conn.execute(
                 """INSERT INTO segments(capture_id, device_id, cycle_id,
@@ -462,10 +599,14 @@ def get_segment(db_path: str, capture_id: str):
 def delete_segment(db_path: str, capture_id: str):
     with db.session(db_path) as conn:
         with db.write_txn(conn):
-            cur = conn.execute("DELETE FROM segments WHERE capture_id=?", (capture_id,))
-            if cur.rowcount == 0:
+            row = conn.execute("SELECT * FROM segments WHERE capture_id=?",
+                               (capture_id,)).fetchone()
+            if not row:
                 raise ApiError(404, "capture_not_found",
                                f"采集编号 {capture_id} 不存在", {"capture_id": capture_id})
+            # 声段所属周期已封存 -> 拒绝删除
+            _raise_if_sealed(_get_cycle(conn, row["device_id"], row["cycle_id"]))
+            conn.execute("DELETE FROM segments WHERE capture_id=?", (capture_id,))
     return 200, {"deleted": capture_id}
 
 

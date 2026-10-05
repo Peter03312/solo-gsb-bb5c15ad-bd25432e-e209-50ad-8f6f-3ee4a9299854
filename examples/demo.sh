@@ -117,3 +117,52 @@ curl -s -X POST "$BASE/versions" | pp
 
 echo; echo "== 回看 v3：各周期冻结不变 =="
 curl -s "$BASE/versions/3" | pp
+
+# ----------------------------------------------------------------------
+# 周期封存（seal）：现场核对完成后冻结单个周期，防止晚到记录改动已确认时间线
+# ----------------------------------------------------------------------
+
+echo; echo "== 周期详情：内容稳定指纹 + 封存状态 =="
+curl -s "$BASE/devices/D1/cycles/default" | pp
+FP=$(curl -s "$BASE/devices/D1/cycles/default" | python3 -c "import sys,json;print(json.load(sys.stdin)['cycle']['fingerprint'])")
+
+echo; echo "== 存在不可定位声段（CAP-0003 越界）-> 409 拒绝封存，状态不变 =="
+curl -s -X POST "$BASE/devices/D1/cycles/default/seal" -H 'Content-Type: application/json' \
+  -d "{\"fingerprint\":\"$FP\"}" | pp
+
+echo; echo "== 移除不可定位声段后，旧指纹即过期 -> 409 seal_fingerprint_stale =="
+curl -s -X DELETE "$BASE/segments/CAP-0003" | pp
+curl -s -X POST "$BASE/devices/D1/cycles/default/seal" -H 'Content-Type: application/json' \
+  -d "{\"fingerprint\":\"$FP\"}" | pp
+
+echo; echo "== 重新获取指纹并封存 -> 返回封存时间与最终指纹 =="
+FP=$(curl -s "$BASE/devices/D1/cycles/default" | python3 -c "import sys,json;print(json.load(sys.stdin)['cycle']['fingerprint'])")
+curl -s -X POST "$BASE/devices/D1/cycles/default/seal" -H 'Content-Type: application/json' \
+  -d "{\"fingerprint\":\"$FP\"}" | pp
+
+echo; echo "== 重复相同封存请求 -> 返回首次结果（幂等，封存时间不变）=="
+curl -s -X POST "$BASE/devices/D1/cycles/default/seal" -H 'Content-Type: application/json' \
+  -d "{\"fingerprint\":\"$FP\"}" | pp
+
+echo; echo "== 封存后该周期锚点新增/更正/删除 -> 409 cycle_sealed =="
+curl -s -X POST "$BASE/devices/D1/anchors" -H 'Content-Type: application/json' \
+  -d '{"local_ms":30000,"utc_ms":1700000030000}' | pp
+curl -s -X PUT "$BASE/devices/D1/anchors" -H 'Content-Type: application/json' \
+  -d '{"anchors":[{"local_ms":1000,"utc_ms":1700000000250}]}' | pp
+curl -s -X DELETE "$BASE/devices/D1/anchors/1000" | pp
+
+echo; echo "== 封存后该周期声段新增/删除 -> 409 cycle_sealed =="
+curl -s -X POST "$BASE/segments" -H 'Content-Type: application/json' \
+  -d '{"capture_id":"CAP-0005","device_id":"D1","local_start_ms":1000,"local_end_ms":2000}' | pp
+curl -s -X DELETE "$BASE/segments/CAP-0001" | pp
+
+echo; echo "== 同内容声段重传 -> 仍按幂等规则返回；异内容 -> 仍按冲突规则处理 =="
+curl -s -X POST "$BASE/segments" -H 'Content-Type: application/json' \
+  -d '{"capture_id":"CAP-0001","device_id":"D1","local_start_ms":5000,"local_end_ms":20000,"note":"鸟鸣"}' | pp
+curl -s -X POST "$BASE/segments" -H 'Content-Type: application/json' \
+  -d '{"capture_id":"CAP-0001","device_id":"D1","local_start_ms":5000,"local_end_ms":20001}' | pp
+
+echo; echo "== 未封存周期（D2/boot-2）不受影响；封存后发布版本行为不变 =="
+curl -s -X POST "$BASE/segments" -H 'Content-Type: application/json' \
+  -d '{"capture_id":"CAP-0102","device_id":"D2","cycle_id":"boot-2","local_start_ms":10000,"local_end_ms":20000}' | pp
+curl -s -X POST "$BASE/versions" -H 'Content-Type: application/json' -d '{"note":"default 周期已封存"}' | pp

@@ -96,6 +96,16 @@ def validate_note(value) -> str | None:
     return value
 
 
+def validate_fingerprint(value) -> str:
+    """封存请求携带的周期内容指纹：64 位小写十六进制（sha256）。"""
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise ApiError(400, "validation_error",
+                       "fingerprint 必须是 64 位小写十六进制字符串（sha256），"
+                       "请从 GET /devices/{id}/cycles/{cycle_id} 周期详情中获取",
+                       {"value": value})
+    return value
+
+
 # ---------------------------------------------------------------- 漂移映射
 
 def _interpolate(l0: int, u0: int, l1: int, u1: int, t: int) -> int:
@@ -163,6 +173,30 @@ def segment_content_hash(capture_id: str, device_id: str, cycle_id: str,
         {"capture_id": capture_id, "device_id": device_id, "cycle_id": cycle_id,
          "local_start_ms": local_start_ms, "local_end_ms": local_end_ms,
          "note": note},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------- 周期封存
+
+def cycle_fingerprint(device_id: str, cycle_id: str,
+                      anchors: list[dict], segments: list[dict]) -> str:
+    """周期内容稳定指纹：由该周期全部锚点与声段内容生成（sha256）。
+
+    - 锚点须已按 local_ms 升序、声段须已按 capture_id 升序（调用方保证），
+      因此同样的内容无论读取多少次都得到同一个指纹；
+    - 声段只计入录入内容（编号、本地起止、note）；UTC 投影由锚点推导，
+      锚点已在指纹中，不重复计入；
+    - 锚点或声段任何一处增删改都会改变指纹，封存请求据此核对"当前内容"。
+    """
+    canonical = json.dumps(
+        {"device_id": device_id, "cycle_id": cycle_id,
+         "anchors": [{"local_ms": a["local_ms"], "utc_ms": a["utc_ms"]}
+                     for a in anchors],
+         "segments": [{"capture_id": s["capture_id"],
+                       "local_start_ms": s["local_start_ms"],
+                       "local_end_ms": s["local_end_ms"],
+                       "note": s["note"]} for s in segments]},
         sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 

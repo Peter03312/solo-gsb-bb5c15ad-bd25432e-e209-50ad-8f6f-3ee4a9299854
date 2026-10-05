@@ -46,6 +46,15 @@ class TimelineClient:
     def list_cycles(self, device_id: str):
         return self._call("GET", f"/devices/{device_id}/cycles")
 
+    def cycle_detail(self, device_id: str, cycle_id: str = "default"):
+        """周期详情：内容稳定指纹 + 封存状态。"""
+        return self._call("GET", f"/devices/{device_id}/cycles/{cycle_id}")
+
+    def seal_cycle(self, device_id: str, cycle_id: str, fingerprint: str):
+        """封存周期：携带周期详情中的内容指纹，不可撤销。"""
+        return self._call("POST", f"/devices/{device_id}/cycles/{cycle_id}/seal",
+                          {"fingerprint": fingerprint})
+
     # 锚点
     def add_anchor(self, device_id: str, local_ms: int, utc_ms: int,
                    cycle_id: str | None = None):
@@ -72,6 +81,9 @@ class TimelineClient:
         if cycle_id is not None:
             payload["cycle_id"] = cycle_id
         return self._call("POST", "/segments", payload)
+
+    def delete_segment(self, capture_id: str):
+        return self._call("DELETE", f"/segments/{capture_id}")
 
     # 时间轴与版本
     def timeline(self):
@@ -151,6 +163,32 @@ def main() -> None:
 
     # 10. 发布 v3：各周期锚点与声段投影原子冻结，文档带 cycle_id / format_rev=2
     show("发布 v3（双周期冻结）", *cli.publish("加入重启周期"))
+
+    # 11. 现场核对完成：封存 D1 的 default 周期，防止晚到记录改动已确认时间线
+    #     周期详情返回内容稳定指纹与封存状态
+    _, detail = cli.cycle_detail("D1", "default")
+    show("D1/default 周期详情（指纹+封存状态）", 200, detail)
+    fp = detail["cycle"]["fingerprint"]
+    #     存在不可定位声段（CAP-0003 越界）-> 409，状态不变
+    show("带不可定位声段封存（409）", *cli.seal_cycle("D1", "default", fp))
+    #     移除该声段后旧指纹即过期 -> 409 seal_fingerprint_stale
+    show("删除不可定位声段 CAP-0003", *cli.delete_segment("CAP-0003"))
+    show("用过期指纹封存（409）", *cli.seal_cycle("D1", "default", fp))
+    #     重新获取指纹并封存 -> 返回封存时间与最终指纹
+    _, detail = cli.cycle_detail("D1", "default")
+    fp = detail["cycle"]["fingerprint"]
+    show("封存 D1/default", *cli.seal_cycle("D1", "default", fp))
+    #     重复相同封存请求 -> 返回首次结果（幂等）
+    show("重复相同封存请求（幂等）", *cli.seal_cycle("D1", "default", fp))
+    #     封存后该周期锚点/声段变更一律 409 cycle_sealed
+    show("封存后新增锚点（409）", *cli.add_anchor("D1", 30000, 1700000030000))
+    show("封存后新声段（409）", *cli.submit_segment("CAP-0005", "D1", 1000, 2000))
+    #     同内容重传仍按幂等规则返回
+    show("封存后同内容重传（幂等）",
+         *cli.submit_segment("CAP-0001", "D1", 5000, 20000, note="鸟鸣"))
+    #     未封存周期（boot-2）不受影响
+    show("未封存周期正常写入",
+         *cli.submit_segment("CAP-0101", "D1", 6000, 8000, cycle_id="boot-2"))
 
 
 if __name__ == "__main__":
